@@ -1,5 +1,29 @@
 import axios from "axios"
 
+// Add the FullFareDetails interface based on the API documentation for the Fare object
+export interface FullFareDetails {
+  Currency: string
+  BaseFare: number
+  Tax: number
+  YQTax: number
+  AdditionalTxnFeePub: number
+  AdditionalTxnFeeOfrd: number
+  OtherCharges: number
+  Discount: number
+  PublishedFare: number
+  OfferedFare: number
+  TdsOnCommission: number
+  TdsOnPLB: number
+  TdsOnIncentive: number
+  ServiceFee: number
+  // Optional fields that might appear in Fare object from Search/FareQuote but not strictly mandatory for Book API
+  PGCharge?: number
+  TotalBaggageCharges?: number
+  TotalMealCharges?: number
+  TotalSeatCharges?: number
+  TotalSpecialServiceCharges?: number
+}
+
 /**
  * Interface for passenger information required for booking
  */
@@ -12,6 +36,7 @@ export interface PassengerInfo {
   Gender: number | string // 1 for Male, 2 for Female
   PassportNo?: string
   PassportExpiry?: string
+  PassportIssueDate?: string // Added based on Book Request documentation
   AddressLine1: string
   AddressLine2?: string
   City: string
@@ -28,6 +53,10 @@ export interface PassengerInfo {
   GSTNumber?: string
   GSTCompanyEmail?: string
   CellCountryCode?: string
+  Fare: FullFareDetails // Changed from 'any' to 'FullFareDetails' and made mandatory as per API
+  Meal?: { Code: string; Description: string } // Added based on Book Request documentation
+  Seat?: { Code: string; Description: string } // Added based on Book Request documentation
+  ExtraBaggage?: { Code: string; Description: string } // Added for consistency with SSR
 }
 
 /**
@@ -236,10 +265,10 @@ export const createBooking = async (bookRequest: BookRequest): Promise<BookRespo
 /**
  * Prepares passenger data for booking request
  * @param passengerData Form data for passenger
- * @param fareDetails Fare details from fare quote
+ * @param fullFareDetails The complete fare details object from FareQuote/Search response
  * @returns Formatted passenger info for booking request
  */
-export const preparePassengerData = (passengerData: any, fareDetails: any): PassengerInfo => {
+export const preparePassengerData = (passengerData: any, fullFareDetails: FullFareDetails): PassengerInfo => {
   // Convert gender from string to number (1 for Male, 2 for Female)
   const genderMap: { [key: string]: number } = {
     male: 1,
@@ -259,18 +288,19 @@ export const preparePassengerData = (passengerData: any, fareDetails: any): Pass
     Title: titleMap[passengerData.title?.toLowerCase()] || passengerData.title || "Mr",
     FirstName: passengerData.firstName,
     LastName: passengerData.lastName,
-    PaxType: 1, // Default to Adult
+    PaxType: passengerData.type === "adult" ? 1 : passengerData.type === "child" ? 2 : 3, // Set PaxType based on type
     DateOfBirth: passengerData.dateOfBirth || undefined,
     Gender: genderMap[passengerData.gender?.toLowerCase()] || 1,
     PassportNo: passengerData.passportNo,
     PassportExpiry: passengerData.passportExpiry,
-    AddressLine1: passengerData.addressLine1 || "Address Line 1", // Required field
+    PassportIssueDate: passengerData.PassportIssueDate, // Added
+    AddressLine1: passengerData.addressLine1 || "123 Main St", // Required field
     AddressLine2: passengerData.addressLine2,
-    City: passengerData.city || "City", // Required field
+    City: passengerData.city || "Mumbai", // Required field
     CountryCode: passengerData.countryCode || "IN", // Required field
     ContactNo: passengerData.mobile || passengerData.contactNo,
     Email: passengerData.email,
-    IsLeadPax: true, // Mark as lead passenger
+    IsLeadPax: passengerData.isLeadPax || false, // Ensure IsLeadPax is correctly set
     Nationality: passengerData.nationality || "IN",
     FFAirlineCode: passengerData.ffAirlineCode,
     FFNumber: passengerData.ffNumber,
@@ -280,6 +310,10 @@ export const preparePassengerData = (passengerData: any, fareDetails: any): Pass
     GSTNumber: passengerData.gstNumber,
     GSTCompanyEmail: passengerData.gstCompanyEmail,
     CellCountryCode: passengerData.cellCountryCode || "+91",
+    Fare: fullFareDetails, // Pass the complete fare details object
+    Meal: passengerData.Meal, // Pass selected meal SSR
+    Seat: passengerData.Seat, // Pass selected seat SSR
+    ExtraBaggage: passengerData.ExtraBaggage, // Pass selected baggage SSR
   }
 }
 

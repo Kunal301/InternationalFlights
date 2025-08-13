@@ -12,6 +12,7 @@ import { Pagination } from "./Search/Pagination"
 import { Header } from "./booking/BookingHeader"
 import NoFlightsFound from "./Search/NotFlightFound"
 import { getFareQuote, type FareQuoteResponse } from "../services/fareService"
+import { reprice, type RepriceResponse } from "../services/repriceService" // Import the new reprice service and its type
 import RoundTripSelectionView from "./Search/RoundTripSelection"
 import MultiCitySelectionView from "./Search/MultiCitySelection"
 import InternationalRoundTripSelectionView from "./Search/InternationalRoundTripSelection" // Import the new component
@@ -127,6 +128,7 @@ interface Segment {
   FareClassification: FareClassification
 }
 
+// Define FareRule interface (was missing)
 interface FareRule {
   Origin: string
   Destination: string
@@ -162,18 +164,6 @@ interface FlightResult {
   AirlineCode: string
   ValidatingAirline: string
   FareClassification: FareClassification
-}
-
-interface SearchResponse {
-  ResponseStatus: number
-  Error: {
-    ErrorCode: number
-    ErrorMessage: string
-  }
-  TraceId: string
-  Origin: string
-  Destination: string
-  Results: FlightResult[][]
 }
 
 // Define CityPair interface for multi-city trips
@@ -1210,6 +1200,21 @@ const SearchResults: React.FC = () => {
     })
   }
 
+  // Helper function to handle failed fare quote/reprice and redirect
+  const handleFlightUnavailable = (errorMessage: string) => {
+    console.error("Flight unavailable, redirecting:", errorMessage)
+    setError(errorMessage) // Set a temporary error message for immediate display if needed
+    setLoading(false)
+    navigate("/flight-not-available", {
+      state: {
+        searchParams: searchForm,
+        sessionId: tokenId,
+        traceId: traceId,
+        multiCityRawResponses: multiCityRawResponses,
+      },
+    })
+  }
+
   // Handler for one-way flight booking (from FlightCard)
   const handleBookOneWayFlight = async (flightId: string) => {
     setLoading(true)
@@ -1231,16 +1236,55 @@ const SearchResults: React.FC = () => {
       let finalResultIndex = ensureResultIndexAsString(flightToBook.ResultIndex)
       let fareQuoteApiResponse: FareQuoteResponse | null = null
 
-      if (flightToBook.IsLCC) {
-        console.log("SearchResults: Quoting LCC one-way flight:", flightToBook.ResultIndex)
-        fareQuoteApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalResultIndex)
-        if (fareQuoteApiResponse.Response && fareQuoteApiResponse.Response.Results) {
-          finalResultIndex = ensureResultIndexAsString(fareQuoteApiResponse.Response.Results.ResultIndex)
-          console.log("SearchResults: LCC one-way flight quoted. New ResultIndex:", finalResultIndex)
+      try {
+        if (flightToBook.IsLCC) {
+          console.log("SearchResults: Quoting LCC one-way flight:", flightToBook.ResultIndex)
+          fareQuoteApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalResultIndex)
+          if (fareQuoteApiResponse.Response && fareQuoteApiResponse.Response.Results) {
+            finalResultIndex = ensureResultIndexAsString(fareQuoteApiResponse.Response.Results.ResultIndex)
+            console.log("SearchResults: LCC one-way flight quoted. New ResultIndex:", finalResultIndex)
+          } else {
+            // Check for specific error codes indicating unavailability
+            const errorCode = fareQuoteApiResponse?.Error?.ErrorCode || fareQuoteApiResponse?.Response?.Error?.ErrorCode;
+            if (errorCode === 1000 || errorCode === 5 || (fareQuoteApiResponse?.Error?.ErrorMessage || "").includes("Fare Quote failed from the Supplier end")) {
+              console.warn("FareQuote failed, attempting reprice for one-way flight.");
+              const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalResultIndex); // Explicitly type repriceResponse
+              if (repriceResponse.Response && repriceResponse.Response.Results) {
+                console.log("Reprice successful for one-way flight. Proceeding with new fare.");
+                fareQuoteApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+                finalResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+              } else {
+                handleFlightUnavailable(`Failed to reprice one-way flight: ${repriceResponse.Error?.ErrorMessage || "Unknown error"}`);
+                return;
+              }
+            } else {
+              throw new Error(
+                `Failed to quote one-way LCC flight: ${fareQuoteApiResponse.Error?.ErrorMessage || "Unknown error"}`,
+              )
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Initial FareQuote attempt failed:", err);
+        if (axios.isAxiosError(err) && (err.response?.status === 400 || err.response?.status === 500 || err.code === 'ERR_NETWORK')) {
+          console.warn("FareQuote failed due to network/server error, attempting reprice for one-way flight.");
+          try {
+            const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalResultIndex); // Explicitly type repriceResponse
+            if (repriceResponse.Response && repriceResponse.Response.Results) {
+              console.log("Reprice successful for one-way flight. Proceeding with new fare.");
+              fareQuoteApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+              finalResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+            } else {
+              handleFlightUnavailable(`Failed to reprice one-way flight after initial quote failure: ${(err as Error).message || "Unknown error"}`);
+              return;
+            }
+          } catch (repriceErr) {
+            handleFlightUnavailable(`Failed to reprice one-way flight after initial quote failure: ${(repriceErr as Error).message || "Unknown error"}`);
+            return;
+          }
         } else {
-          throw new Error(
-            `Failed to quote one-way LCC flight: ${fareQuoteApiResponse.Error?.ErrorMessage || "Unknown error"}`,
-          )
+          handleFlightUnavailable(`Failed to quote one-way flight: ${(err as Error).message || "Unknown error"}`);
+          return;
         }
       }
 
@@ -1265,7 +1309,7 @@ const SearchResults: React.FC = () => {
       })
     } catch (err) {
       console.error("Error preparing for one-way booking:", err)
-      setError("Failed to prepare flight for booking")
+      handleFlightUnavailable(`Failed to prepare flight for booking: ${(err as Error).message || "Unknown error"}`);
     } finally {
       setLoading(false)
     }
@@ -1292,35 +1336,112 @@ const SearchResults: React.FC = () => {
       }
 
       let finalOutboundResultIndex = ensureResultIndexAsString(outboundFlight.ResultIndex)
-      let fareQuoteOutboundApiResponse: FareQuoteResponse | null = null
+      let fareQuoteOutboundApiResponse: FareQuoteResponse | null = null;
 
-      if (outboundFlight.IsLCC) {
-        console.log("SearchResults: Quoting LCC outbound leg:", outboundFlight.ResultIndex)
-        fareQuoteOutboundApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalOutboundResultIndex)
-        if (fareQuoteOutboundApiResponse.Response && fareQuoteOutboundApiResponse.Response.Results) {
-          finalOutboundResultIndex = ensureResultIndexAsString(
-            fareQuoteOutboundApiResponse.Response.Results.ResultIndex,
-          )
-          console.log("SearchResults: LCC outbound quoted. New ResultIndex:", finalOutboundResultIndex)
+      try {
+        if (outboundFlight.IsLCC) {
+          console.log("SearchResults: Quoting LCC outbound leg:", outboundFlight.ResultIndex)
+          fareQuoteOutboundApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalOutboundResultIndex)
+          if (fareQuoteOutboundApiResponse.Response && fareQuoteOutboundApiResponse.Response.Results) {
+            finalOutboundResultIndex = ensureResultIndexAsString(
+              fareQuoteOutboundApiResponse.Response.Results.ResultIndex,
+            )
+            console.log("SearchResults: LCC outbound quoted. New ResultIndex:", finalOutboundResultIndex)
+          } else {
+            const errorCode = fareQuoteOutboundApiResponse?.Error?.ErrorCode || fareQuoteOutboundApiResponse?.Response?.Error?.ErrorCode;
+            if (errorCode === 1000 || errorCode === 5 || (fareQuoteOutboundApiResponse?.Error?.ErrorMessage || "").includes("Fare Quote failed from the Supplier end")) {
+              console.warn("FareQuote failed, attempting reprice for outbound leg.");
+              const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalOutboundResultIndex); // Explicitly type repriceResponse
+              if (repriceResponse.Response && repriceResponse.Response.Results) {
+                console.log("Reprice successful for outbound leg. Proceeding with new fare.");
+                fareQuoteOutboundApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+                finalOutboundResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+              } else {
+                handleFlightUnavailable(`Failed to reprice outbound leg: ${repriceResponse.Error?.ErrorMessage || "Unknown error"}`);
+                return;
+              }
+            } else {
+              throw new Error(
+                `Failed to quote outbound LCC flight: ${fareQuoteOutboundApiResponse.Error?.ErrorMessage || "Unknown error"}`,
+              )
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Initial FareQuote attempt for outbound leg failed:", err);
+        if (axios.isAxiosError(err) && (err.response?.status === 400 || err.response?.status === 500 || err.code === 'ERR_NETWORK')) {
+          console.warn("FareQuote failed due to network/server error, attempting reprice for outbound leg.");
+          try {
+            const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalOutboundResultIndex); // Explicitly type repriceResponse
+            if (repriceResponse.Response && repriceResponse.Response.Results) {
+              console.log("Reprice successful for outbound leg. Proceeding with new fare.");
+              fareQuoteOutboundApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+              finalOutboundResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+            } else {
+              handleFlightUnavailable(`Failed to reprice outbound leg after initial quote failure: ${(err as Error).message || "Unknown error"}`);
+              return;
+            }
+          } catch (repriceErr) {
+            handleFlightUnavailable(`Failed to reprice outbound leg after initial quote failure: ${(repriceErr as Error).message || "Unknown error"}`);
+            return;
+          }
         } else {
-          throw new Error(
-            `Failed to quote outbound LCC flight: ${fareQuoteOutboundApiResponse.Error?.ErrorMessage || "Unknown error"}`,
-          )
+          handleFlightUnavailable(`Failed to quote outbound leg: ${(err as Error).message || "Unknown error"}`);
+          return;
         }
       }
 
       let finalReturnResultIndex = ensureResultIndexAsString(returnFlightToBook.ResultIndex)
-      let fareQuoteReturnApiResponse: FareQuoteResponse | null = null
-      if (returnFlightToBook.IsLCC) {
-        console.log("SearchResults: Quoting LCC return leg:", returnFlightToBook.ResultIndex)
-        fareQuoteReturnApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalReturnResultIndex)
-        if (fareQuoteReturnApiResponse.Response && fareQuoteReturnApiResponse.Response.Results) {
-          finalReturnResultIndex = ensureResultIndexAsString(fareQuoteReturnApiResponse.Response.Results.ResultIndex)
-          console.log("SearchResults: LCC return quoted. New ResultIndex:", finalReturnResultIndex)
+      let fareQuoteReturnApiResponse: FareQuoteResponse | null = null;
+
+      try {
+        if (returnFlightToBook.IsLCC) {
+          console.log("SearchResults: Quoting LCC return leg:", returnFlightToBook.ResultIndex)
+          fareQuoteReturnApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalReturnResultIndex)
+          if (fareQuoteReturnApiResponse.Response && fareQuoteReturnApiResponse.Response.Results) {
+            finalReturnResultIndex = ensureResultIndexAsString(fareQuoteReturnApiResponse.Response.Results.ResultIndex)
+            console.log("SearchResults: LCC return quoted. New ResultIndex:", finalReturnResultIndex)
+          } else {
+            const errorCode = fareQuoteReturnApiResponse?.Error?.ErrorCode || fareQuoteReturnApiResponse?.Response?.Error?.ErrorCode;
+            if (errorCode === 1000 || errorCode === 5 || (fareQuoteReturnApiResponse?.Error?.ErrorMessage || "").includes("Fare Quote failed from the Supplier end")) {
+              console.warn("FareQuote failed, attempting reprice for return leg.");
+              const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalReturnResultIndex); // Explicitly type repriceResponse
+              if (repriceResponse.Response && repriceResponse.Response.Results) {
+                console.log("Reprice successful for return leg. Proceeding with new fare.");
+                fareQuoteReturnApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+                finalReturnResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+              } else {
+                handleFlightUnavailable(`Failed to reprice return leg: ${repriceResponse.Error?.ErrorMessage || "Unknown error"}`);
+                return;
+              }
+            } else {
+              throw new Error(
+                `Failed to quote return LCC flight: ${fareQuoteReturnApiResponse.Error?.ErrorMessage || "Unknown error"}`,
+              )
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Initial FareQuote attempt for return leg failed:", err);
+        if (axios.isAxiosError(err) && (err.response?.status === 400 || err.response?.status === 500 || err.code === 'ERR_NETWORK')) {
+          console.warn("FareQuote failed due to network/server error, attempting reprice for return leg.");
+          try {
+            const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalReturnResultIndex); // Explicitly type repriceResponse
+            if (repriceResponse.Response && repriceResponse.Response.Results) {
+              console.log("Reprice successful for return leg. Proceeding with new fare.");
+              fareQuoteReturnApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+              finalReturnResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+            } else {
+              handleFlightUnavailable(`Failed to reprice return leg after initial quote failure: ${(err as Error).message || "Unknown error"}`);
+              return;
+            }
+          } catch (repriceErr) {
+            handleFlightUnavailable(`Failed to reprice return leg after initial quote failure: ${(repriceErr as Error).message || "Unknown error"}`);
+            return;
+          }
         } else {
-          throw new Error(
-            `Failed to quote return LCC flight: ${fareQuoteReturnApiResponse.Error?.ErrorMessage || "Unknown error"}`,
-          )
+          handleFlightUnavailable(`Failed to quote return leg: ${(err as Error).message || "Unknown error"}`);
+          return;
         }
       }
 
@@ -1331,9 +1452,10 @@ const SearchResults: React.FC = () => {
         fareQuoteReturnApiResponse?.Response?.Results || returnFlightToBook,
       )
 
+      // Fix: Ensure TotalPrice is converted to number before addition
       const finalTotalPrice =
-        (fareQuoteOutboundApiResponse?.Response?.Results?.Fare.PublishedFare || outboundFlight.Fare.PublishedFare) +
-        (fareQuoteReturnApiResponse?.Response?.Results?.Fare.PublishedFare || returnFlightToBook.Fare.PublishedFare)
+        (fareQuoteOutboundApiResponse?.Response?.Results?.Fare.PublishedFare || Number(adaptedOutboundFlight.OptionPriceInfo.TotalPrice)) +
+        (fareQuoteReturnApiResponse?.Response?.Results?.Fare.PublishedFare || Number(adaptedReturnFlight.OptionPriceInfo.TotalPrice))
 
       localStorage.setItem("selectedFlight", JSON.stringify(adaptedOutboundFlight))
       localStorage.setItem("selectedReturnFlight", JSON.stringify(adaptedReturnFlight))
@@ -1358,69 +1480,215 @@ const SearchResults: React.FC = () => {
       })
     } catch (err) {
       console.error("Error preparing for domestic round trip booking:", err)
-      setError("Failed to prepare flight for booking")
+      handleFlightUnavailable(`Failed to prepare flight for booking: ${(err as Error).message || "Unknown error"}`);
     } finally {
       setLoading(false)
     }
   }
 
+ 
   // Handler for international combined round trip booking (from InternationalRoundTripSelectionView)
-  const handleBookInternationalCombinedFlight = async (selectedFlight: FlightResult) => {
-    setLoading(true)
-    setError("")
+  const handleBookInternationalCombinedFlight = async (
+  selectedFlight: FlightResult,
+  fromFallback: boolean = false
+) => {
+  setLoading(true);
+  setError("");
 
-    try {
-      const currentTokenId = tokenId || localStorage.getItem("tokenId")
-      const currentTraceId = traceId || localStorage.getItem("traceId")
+  // --- small, local helpers so we don't add globals ---
+  const buildRoundTripRequestForFallback = () => {
+    const currentTokenId = tokenId || localStorage.getItem("tokenId");
+    if (!currentTokenId) throw new Error("Missing TokenId for fallback search");
 
-      if (!currentTokenId || !currentTraceId) {
-        throw new Error("Session information is missing. Please search again.")
-      }
-
-      let finalResultIndex = ensureResultIndexAsString(selectedFlight.ResultIndex)
-      let fareQuoteApiResponse: FareQuoteResponse | null = null
-
-      if (selectedFlight.IsLCC) {
-        console.log("SearchResults: Quoting LCC combined international flight:", selectedFlight.ResultIndex)
-        fareQuoteApiResponse = await getFareQuote(currentTokenId, currentTraceId, finalResultIndex)
-        if (fareQuoteApiResponse.Response && fareQuoteApiResponse.Response.Results) {
-          finalResultIndex = ensureResultIndexAsString(fareQuoteApiResponse.Response.Results.ResultIndex)
-          console.log("SearchResults: LCC combined international flight quoted. New ResultIndex:", finalResultIndex)
-        } else {
-          throw new Error(
-            `Failed to quote combined international LCC flight: ${fareQuoteApiResponse.Error?.ErrorMessage || "Unknown error"}`,
-          )
-        }
-      }
-
-      const adaptedFlight = adaptFlightForCard(fareQuoteApiResponse?.Response?.Results || selectedFlight)
-
-      localStorage.setItem("selectedFlight", JSON.stringify(adaptedFlight))
-      localStorage.setItem("searchParams", JSON.stringify(searchForm))
-      localStorage.setItem("traceId", currentTraceId || "")
-
-      navigate("/booking", {
-        state: {
-          flight: adaptedFlight,
-          searchParams: searchForm,
-          tokenId: currentTokenId,
-          traceId: currentTraceId,
-          isRoundTrip: true,
-          isInternationalCombined: true, // Explicitly mark as combined international
-          totalPrice: adaptedFlight.OptionPriceInfo.TotalPrice,
-          outboundResultIndex: finalResultIndex, // This is the combined result index
-          fareQuoteOutboundResponse: fareQuoteApiResponse,
+    const req: any = {
+      EndUserIp: "192.168.1.1",
+      TokenId: currentTokenId,
+      AdultCount: searchForm.passengers.toString(),
+      ChildCount: "0",
+      InfantCount: "0",
+      DirectFlight: searchForm.directFlight ? "true" : "false",
+      OneStopFlight: "false",
+      JourneyType: "2",
+      Segments: [
+        {
+          Origin: searchForm.from,
+          Destination: searchForm.to,
+          FlightCabinClass: "1",
+          PreferredDepartureTime: formatDateForApi(searchForm.date),
+          PreferredArrivalTime: formatDateForApi(searchForm.date),
         },
-      })
-    } catch (err) {
-      console.error("Error preparing for international combined booking:", err)
-      setError("Failed to prepare flight for booking")
-    } finally {
-      setLoading(false)
-    }
-  }
+        {
+          Origin: searchForm.to,
+          Destination: searchForm.from,
+          FlightCabinClass: "1",
+          PreferredDepartureTime: formatDateForApi(searchForm.returnDate || ""),
+          PreferredArrivalTime: formatDateForApi(searchForm.returnDate || ""),
+        },
+      ],
+    };
 
-  const handleBookMultiCityFlights = (selectedFlightIds: string[]) => {
+    if (searchForm.resultFareType) req.ResultFareType = searchForm.resultFareType;
+    req.PreferredAirlines =
+      searchForm.preferredAirlines && searchForm.preferredAirlines.length > 0
+        ? searchForm.preferredAirlines
+        : null;
+    req.Sources =
+      searchForm.sources && searchForm.sources.length > 0 ? searchForm.sources : null;
+
+    return req;
+  };
+
+  const pickBestMatch = (results: FlightResult[], target: FlightResult): FlightResult | null => {
+    if (!results?.length || !target?.Segments?.length) return null;
+    const tgtOut = target.Segments?.[0]?.[0];
+    const tgtRet = target.Segments?.[1]?.[0];
+    const toMs = (s?: string) => (s ? new Date(s).getTime() : 0);
+
+    let best: { f: FlightResult; score: number } | null = null;
+    for (const f of results) {
+      const out = f.Segments?.[0]?.[0];
+      const ret = f.Segments?.[1]?.[0];
+      let score = 0;
+
+      if (out && tgtOut && out.Airline.AirlineCode === tgtOut.Airline.AirlineCode) score += 50;
+      if (ret && tgtRet && ret.Airline.AirlineCode === tgtRet.Airline.AirlineCode) score += 50;
+
+      if (out && tgtOut) {
+        const diffMin = Math.abs(toMs(out.Origin.DepTime) - toMs(tgtOut.Origin.DepTime)) / 60000;
+        score += 30 - Math.min(30, diffMin);
+      }
+      if (ret && tgtRet) {
+        const diffMin = Math.abs(toMs(ret.Origin.DepTime) - toMs(tgtRet.Origin.DepTime)) / 60000;
+        score += 30 - Math.min(30, diffMin);
+      }
+
+      if (!best || score > best.score) best = { f, score };
+    }
+    return best?.f || null;
+  };
+
+  const freshSearchAndRematchOnce = async (): Promise<FlightResult | null> => {
+    try {
+      const req = buildRoundTripRequestForFallback();
+      const response = await axios.post("http://localhost:5000/api/search", req, {
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        timeout: 30000,
+      });
+      if (!(response?.data?.Response?.ResponseStatus === 1)) return null;
+
+      const R = response.data.Response.Results;
+      let combined: FlightResult[] = [];
+      // Combined international RT usually arrives as Results[0] = array of options
+      if (Array.isArray(R) && Array.isArray(R[0]) && R[0][0]?.Segments?.length === 2) {
+        combined = processFlightResults(R[0]);
+      } else if (Array.isArray(R) && !Array.isArray(R[0])) {
+        combined = processFlightResults(R as any);
+      }
+      if (!combined.length) return null;
+
+      // keep state consistent with a normal search
+      setInternationalCombinedFlights(combined);
+      setLastSearchedType("round-trip");
+      setIsInternationalCombinedRoundTrip(true);
+      setOutboundResults([]);
+      setReturnResults([]);
+      setResults([]);
+      localStorage.setItem("searchResults", JSON.stringify(combined));
+      localStorage.setItem("traceId", response.data.Response.TraceId || "");
+
+      return pickBestMatch(combined, selectedFlight);
+    } catch (e) {
+      console.warn("Fallback fresh search failed:", e);
+      return null;
+    }
+  };
+  // --- end local helpers ---
+
+  try {
+    const currentTokenId = tokenId || localStorage.getItem("tokenId");
+    const currentTraceId = traceId || localStorage.getItem("traceId");
+    if (!currentTokenId || !currentTraceId) {
+      throw new Error("Session information is missing. Please search again.");
+    }
+
+    let finalResultIndex = ensureResultIndexAsString(selectedFlight.ResultIndex);
+
+    // 1) FareQuote attempt
+    try {
+      const fq = await getFareQuote(currentTokenId, currentTraceId, finalResultIndex);
+      const r = fq?.Response?.Results;
+      if (r?.Segments) {
+        navigate("/booking", {
+          state: {
+            fareQuoteOutboundResponse: fq,
+            flight: r,
+            searchParams: searchForm,
+            tokenId: currentTokenId,
+            traceId: currentTraceId,
+            isRoundTrip: true,
+            isInternationalCombined: true,
+            totalPrice: r.Fare.PublishedFare,
+            outboundResultIndex: ensureResultIndexAsString(r.ResultIndex),
+          },
+        });
+        return;
+      }
+
+      // Quote returned but not usable → check recoverable supplier error
+      const errorCode = fq?.Error?.ErrorCode || fq?.Response?.Error?.ErrorCode;
+      const errorMsg =
+        fq?.Error?.ErrorMessage || fq?.Response?.Error?.ErrorMessage || "";
+      if (!(errorCode === 1000 || errorCode === 5 || /fare quote failed from the supplier/i.test(errorMsg))) {
+        throw new Error(errorMsg || "Unknown error");
+      }
+      // fall through to reprice
+    } catch {
+      // if getFareQuote threw, we still try reprice
+    }
+
+    // 2) Reprice attempt
+    try {
+      const rp: RepriceResponse = await reprice(currentTokenId, currentTraceId, finalResultIndex);
+      const r = rp?.Response?.Results;
+      if (r) {
+        navigate("/booking", {
+          state: {
+            fareQuoteOutboundResponse: rp as unknown as FareQuoteResponse,
+            flight: r,
+            searchParams: searchForm,
+            tokenId: currentTokenId,
+            traceId: currentTraceId,
+            isRoundTrip: true,
+            isInternationalCombined: true,
+            totalPrice: r.Fare.PublishedFare,
+            outboundResultIndex: ensureResultIndexAsString(r.ResultIndex),
+          },
+        });
+        return;
+      }
+    } catch {
+      // ignore; try fresh search next
+    }
+
+    // 3) Fresh search + rematch (only once)
+    if (!fromFallback) {
+      const rematched = await freshSearchAndRematchOnce();
+      if (rematched) {
+        await handleBookInternationalCombinedFlight(rematched, true);
+        return;
+      }
+    }
+
+    handleFlightUnavailable("Failed to quote combined international flight after reprice and fresh search.");
+  } catch (err: any) {
+    handleFlightUnavailable(`Failed to prepare flight for booking: ${err?.message || "Unknown error"}`);
+  } finally {
+    setLoading(false);
+  }
+};
+
+
+  const handleBookMultiCityFlights = async (selectedFlightIds: string[]) => { // Marked as async
     setLoading(true)
     setError("")
 
@@ -1428,24 +1696,90 @@ const SearchResults: React.FC = () => {
       const selectedFlightsWithTraceIds: { flight: any; traceId: string; resultIndex: string }[] = []
       const cleanSelectedFlightIds = selectedFlightIds.map((id) => ensureResultIndexAsString(id))
 
-      cleanSelectedFlightIds.forEach((flightId, index) => {
-        const segmentRawData = multiCityRawResponses.find((seg) => seg.segmentIndex === index) // Find the raw response for this segment
+      // This part needs to be careful with reprice. Repricing multi-city segments individually
+      // might be complex if the backend expects a single reprice call for the entire multi-city itinerary.
+      // For now, I'll apply the reprice logic to each segment's fare quote attempt.
+
+      const processSegmentForBooking = async (flightId: string, index: number) => { // Marked as async
+        const segmentRawData = multiCityRawResponses.find((seg) => seg.segmentIndex === index)
         const flight = segmentRawData?.flights?.find((f) => ensureResultIndexAsString(f.ResultIndex) === flightId)
 
-        if (flight && segmentRawData) {
-          const adaptedFlight = adaptFlightForCard(flight)
-          selectedFlightsWithTraceIds.push({
-            flight: adaptedFlight,
-            traceId: segmentRawData.traceId, // Use the segment's traceId
-            resultIndex: ensureResultIndexAsString(flight.ResultIndex),
-          })
-        } else {
-          console.error(`Flight with ID ${flightId} not found in segment ${index} or raw data missing.`)
+        if (!flight || !segmentRawData) {
+          throw new Error(`Flight with ID ${flightId} not found in segment ${index} or raw data missing.`)
         }
-      })
+
+        const currentTokenId = tokenId || localStorage.getItem("tokenId")
+        const currentTraceId = segmentRawData.traceId // Use segment-specific traceId
+        let currentResultIndex = ensureResultIndexAsString(flight.ResultIndex)
+
+        if (!currentTokenId || !currentTraceId) {
+          throw new Error("Session information is missing. Please search again.")
+        }
+
+        let fareQuoteApiResponse: FareQuoteResponse | null = null;
+
+        try {
+          console.log(`SearchResults: Quoting multi-city segment ${index + 1}:`, currentResultIndex);
+          fareQuoteApiResponse = await getFareQuote(currentTokenId, currentTraceId, currentResultIndex);
+
+          if (fareQuoteApiResponse.Response && fareQuoteApiResponse.Response.Results) {
+            currentResultIndex = ensureResultIndexAsString(fareQuoteApiResponse.Response.Results.ResultIndex);
+            console.log(`SearchResults: Multi-city segment ${index + 1} quoted. New ResultIndex:`, currentResultIndex);
+          } else {
+            const errorCode = fareQuoteApiResponse?.Error?.ErrorCode || fareQuoteApiResponse?.Response?.Error?.ErrorCode;
+            if (errorCode === 1000 || errorCode === 5 || (fareQuoteApiResponse?.Error?.ErrorMessage || "").includes("Fare Quote failed from the Supplier end")) {
+              console.warn(`FareQuote failed, attempting reprice for multi-city segment ${index + 1}.`);
+              const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, currentResultIndex); // Explicitly type repriceResponse
+              if (repriceResponse.Response && repriceResponse.Response.Results) {
+                console.log(`Reprice successful for multi-city segment ${index + 1}. Proceeding with new fare.`);
+                fareQuoteApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+                currentResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+              } else {
+                throw new Error(`Failed to reprice multi-city segment ${index + 1}: ${repriceResponse.Error?.ErrorMessage || "Unknown error"}`);
+              }
+            } else {
+              throw new Error(`Failed to quote multi-city segment ${index + 1}: ${fareQuoteApiResponse.Error?.ErrorMessage || "Unknown error"}`);
+            }
+          }
+        } catch (err) {
+          console.error(`Initial FareQuote attempt for multi-city segment ${index + 1} failed:`, err);
+          if (axios.isAxiosError(err) && (err.response?.status === 400 || err.response?.status === 500 || err.code === 'ERR_NETWORK')) {
+            console.warn(`FareQuote failed due to network/server error, attempting reprice for multi-city segment ${index + 1}.`);
+            try {
+              const repriceResponse: RepriceResponse = await reprice(currentTokenId, currentTraceId, currentResultIndex); // Explicitly type repriceResponse
+              if (repriceResponse.Response && repriceResponse.Response.Results) {
+                console.log(`Reprice successful for multi-city segment ${index + 1}. Proceeding with new fare.`);
+                fareQuoteApiResponse = repriceResponse as FareQuoteResponse; // Cast to FareQuoteResponse
+                currentResultIndex = ensureResultIndexAsString(repriceResponse.Response.Results.ResultIndex);
+              } else {
+                throw new Error(`Failed to reprice multi-city segment ${index + 1} after initial quote failure: ${(err as Error).message || "Unknown error"}`);
+              }
+            } catch (repriceErr) {
+              throw new Error(`Failed to reprice multi-city segment ${index + 1} after initial quote failure: ${(repriceErr as Error).message || "Unknown error"}`);
+            }
+          } else {
+            throw new Error(`Failed to quote multi-city segment ${index + 1}: ${(err as Error).message || "Unknown error"}`);
+          }
+        }
+
+        const adaptedFlight = adaptFlightForCard(fareQuoteApiResponse?.Response?.Results || flight);
+        return {
+          flight: adaptedFlight,
+          traceId: currentTraceId, // Keep original traceId for this segment
+          resultIndex: currentResultIndex, // Use the potentially new resultIndex
+        };
+      };
+
+      // Process all segments in parallel
+      const segmentPromises = cleanSelectedFlightIds.map((flightId, index) =>
+        processSegmentForBooking(flightId, index)
+      );
+
+      const processedSegments = await Promise.all(segmentPromises);
+      selectedFlightsWithTraceIds.push(...processedSegments);
 
       if (selectedFlightsWithTraceIds.length !== cleanSelectedFlightIds.length) {
-        throw new Error("Some selected multi-city flights could not be found with their trace IDs.")
+        throw new Error("Some selected multi-city flights could not be found or processed.");
       }
 
       localStorage.setItem("selectedMultiCityFlightsWithTraceIds", JSON.stringify(selectedFlightsWithTraceIds))
@@ -1453,7 +1787,7 @@ const SearchResults: React.FC = () => {
       // No longer store a single traceId in localStorage for multi-city, as it's per segment
 
       const totalPrice = selectedFlightsWithTraceIds.reduce(
-        (sum, item) => sum + Number(item.flight.OptionPriceInfo.TotalPrice),
+        (sum, item) => sum + Number(item.flight.OptionPriceInfo.TotalPrice), // Fix: Convert to number
         0,
       )
 
@@ -1473,7 +1807,7 @@ const SearchResults: React.FC = () => {
       })
     } catch (err) {
       console.error("Error preparing for multi-city booking:", err)
-      setError("Failed to prepare flights for booking")
+      handleFlightUnavailable(`Failed to prepare flights for booking: ${(err as Error).message || "Unknown error"}`);
     } finally {
       setLoading(false)
     }

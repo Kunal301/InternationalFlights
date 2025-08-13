@@ -1,39 +1,40 @@
 "use client"
 
-import React from "react"
-import { useState, useEffect } from "react"
+import React, { useEffect, useState } from "react"
 import { Routes, Route, Navigate, useNavigate } from "react-router-dom"
 import Login from "./components/login"
 import Dashboard from "./components/common/dashboard"
 import SearchResults from "./components/SearchResults"
 import BookingPage from "./components/booking/BookingPage"
+import BookingConfirmation from "./components/booking/BookingConfirmation" // Re-added import
+import TicketDetails from "./components/ticket/TicketDetails" // Re-added import
+import BackendTest from "./components/Debug/BackendTest" // Re-added import
+import ApiDebugger from "./components/Debug/ApiDebugger" // Re-added import
+import BookingHistory from "./components/booking/BookingHistory" // Re-added import
 import { SessionTimeoutProvider } from "./context/SessionTimeoutProvider"
+import FlightNotAvailablePage from "./components/FlightNotAvailablePage"
 
 const App: React.FC = () => {
   const [sessionId, setSessionId] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true) // <-- Step 1
+  const [loading, setLoading] = useState(true)
   const navigate = useNavigate()
 
-  // Step 1: Check for existing session on app load
   useEffect(() => {
     const storedSessionId = localStorage.getItem("sessionId")
     const storedTokenId = localStorage.getItem("tokenId") || localStorage.getItem("TokenId")
 
-    // Only set session if both sessionId and tokenId exist
     if (storedSessionId && storedTokenId) {
       setSessionId(storedSessionId)
     } else {
-      // Clear any partial session data
       localStorage.removeItem("sessionId")
       localStorage.removeItem("tokenId")
       localStorage.removeItem("TokenId")
       setSessionId(null)
     }
 
-    setLoading(false) // <-- Only allow rendering once check is done
+    setLoading(false)
   }, [])
 
-  // Update sessionId state when localStorage changes
   useEffect(() => {
     const handleStorageChange = (event: StorageEvent) => {
       if (event.key === "sessionId" || event.key === "tokenId" || event.key === "TokenId") {
@@ -69,13 +70,11 @@ const App: React.FC = () => {
     return <>{children}</>
   })
 
-  // Step 2: Don't render until session check is done
-  if (loading) return null;
+  if (loading) return null
 
   return (
     <SessionTimeoutProvider timeoutMinutes={15}>
       <Routes>
-        {/* Step 3: Root route defaults to login if not authenticated */}
         <Route path="/" element={<Navigate to={sessionId ? "/dashboard" : "/login"} replace />} />
 
         <Route
@@ -98,7 +97,14 @@ const App: React.FC = () => {
             </ProtectedRoute>
           }
         />
-
+        <Route
+          path="/flight-not-available"
+          element={
+            <ProtectedRoute>
+              <FlightNotAvailablePage />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="/search-results"
           element={
@@ -107,7 +113,6 @@ const App: React.FC = () => {
             </ProtectedRoute>
           }
         />
-
         <Route
           path="/booking"
           element={
@@ -116,6 +121,33 @@ const App: React.FC = () => {
             </ProtectedRoute>
           }
         />
+        <Route
+          path="/booking-confirmation"
+          element={
+            <ProtectedRoute>
+              <BookingConfirmation />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/ticket-details"
+          element={
+            <ProtectedRoute>
+              <TicketDetails />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/booking-history"
+          element={
+            <ProtectedRoute>
+              <BookingHistory />
+            </ProtectedRoute>
+          }
+        />
+        {/* Debug Routes */}
+        <Route path="/debug/backend-test" element={<BackendTest />} />
+        <Route path="/debug/api-debugger" element={<ApiDebugger />} />
 
         {/* Catch-all for 404 */}
         <Route path="*" element={<Navigate to="/" replace />} />
